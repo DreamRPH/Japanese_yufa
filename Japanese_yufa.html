@@ -18374,24 +18374,82 @@
       showToast('💾 已在当前设备保存云端同步配置');
     }
 
+    function normalizeGistIdInput(rawId) {
+      if (!rawId) return '';
+      const trimmed = String(rawId).trim();
+      const match = trimmed.match(/([a-f0-9]{20,40})/i);
+      return match ? match[1] : trimmed;
+    }
+
+    async function autoDiscoverKotonohaGistId(token) {
+      if (!token) return '';
+      try {
+        const res = await fetch('https://api.github.com/gists?per_page=30', {
+          headers: {
+            'Authorization': `token ${token}`,
+            'Accept': 'application/vnd.github.v3+json'
+          },
+          cache: 'no-store'
+        });
+        if (!res.ok) return '';
+        const list = await res.json();
+        if (!Array.isArray(list)) return '';
+        const found = list.find(g =>
+          (g.description && g.description.includes('Kotonoha')) ||
+          (g.files && (g.files['kotonoha_grammar_sync.json'] || g.files['kotonoha_chunk_1.txt']))
+        );
+        return found && found.id ? found.id : '';
+      } catch (e) {
+        return '';
+      }
+    }
+
     async function pushToGithubGist() {
       const token = document.getElementById('syncGithubToken').value.trim();
-      let gistId = document.getElementById('syncGistId').value.trim();
+      let gistId = normalizeGistIdInput(document.getElementById('syncGistId').value);
       if (!token) {
         showToast('请先填入 GitHub Personal Access Token，或使用右侧免账号「跨设备同步码」', 'error');
         return;
       }
+      document.getElementById('syncGistId').value = gistId;
       saveCloudConfig();
+
+      // GitHub Gist API 对单文件超过 1MB (约1000KB) 会在拉取时截断 (truncated: true)
+      // 因此自动采用分片存储 (每片 350,000 字符 ≈ 450KB)，确保拉取时 100% 完整不截断
+      const fullJson = JSON.stringify(appState.data);
+      const CHUNK_SIZE = 350000;
+      const chunks = [];
+      for (let i = 0; i < fullJson.length; i += CHUNK_SIZE) {
+        chunks.push(fullJson.slice(i, i + CHUNK_SIZE));
+      }
+
+      const filesPayload = {
+        'kotonoha_grammar_sync.json': {
+          content: JSON.stringify({
+            chunked: true,
+            chunkCount: chunks.length,
+            totalLength: fullJson.length,
+            updatedAt: appState.data.updatedAt || Date.now(),
+            version: appState.data.version || '5.0.0-N1-TO-N5-ALL-739'
+          }, null, 2)
+        }
+      };
+      chunks.forEach((chunkStr, idx) => {
+        filesPayload[`kotonoha_chunk_${idx + 1}.txt`] = { content: chunkStr };
+      });
+
       const payload = {
         description: 'Kotonoha Japanese Grammar System Sync Data',
         public: false,
-        files: {
-          'kotonoha_grammar_sync.json': {
-            content: JSON.stringify(appState.data, null, 2)
-          }
-        }
+        files: filesPayload
       };
+
       try {
+        showToast('☁️ 正在推送分片数据到 GitHub Gist 云端...', 'info');
+        if (!gistId) {
+          const discovered = await autoDiscoverKotonohaGistId(token);
+          if (discovered) gistId = discovered;
+        }
         const url = gistId ? `https://api.github.com/gists/${gistId}` : 'https://api.github.com/gists';
         const method = gistId ? 'PATCH' : 'POST';
         const res = await fetch(url, {
@@ -18409,33 +18467,109 @@
           document.getElementById('syncGistId').value = result.id;
           saveCloudConfig();
         }
-        showToast(`☁️ 推送成功！请记下 Gist ID (${result.id}) 在平板端拉取`);
+        showToast(`☁️ 推送成功（共 ${chunks.length} 个云端分片）！平板/手机填入 Token 即可直接拉取`);
       } catch (err) {
-        showToast('云端连接受限或 Token 无效，推荐使用右侧「跨设备同步码」或网盘 JSON 同步', 'error');
+        showToast('云端推送受限或 Token 无效，请检查 Token 是否勾选 gist 权限', 'error');
       }
     }
 
     async function pullFromGithubGist() {
       const token = document.getElementById('syncGithubToken').value.trim();
-      const gistId = document.getElementById('syncGistId').value.trim();
+      let gistId = normalizeGistIdInput(document.getElementById('syncGistId').value);
+
+      if (!gistId && token) {
+        showToast('🔍 正在通过 Token 自动查找您的云端 Gist 同步库...', 'info');
+        gistId = await autoDiscoverKotonohaGistId(token);
+        if (gistId) {
+          document.getElementById('syncGistId').value = gistId;
+        }
+      }
+
       if (!gistId) {
-        showToast('请填入云端同步库 Gist ID 后再点击拉取', 'error');
+        showToast('请填入云端同步库 Gist ID（或填入 GitHub Token 自动查找）后再点击拉取', 'error');
         return;
       }
+      document.getElementById('syncGistId').value = gistId;
       saveCloudConfig();
+
       try {
+        showToast('☁️ 正在从 GitHub 云端拉取同步数据...', 'info');
         const headers = { 'Accept': 'application/vnd.github.v3+json' };
         if (token) headers['Authorization'] = `token ${token}`;
-        const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers });
+        let res = await fetch(`https://api.github.com/gists/${gistId}`, {
+          headers,
+          cache: 'no-store'
+        });
+        if (res.status === 404 && token) {
+          const discovered = await autoDiscoverKotonohaGistId(token);
+          if (discovered && discovered !== gistId) {
+            gistId = discovered;
+            document.getElementById('syncGistId').value = gistId;
+            saveCloudConfig();
+            res = await fetch(`https://api.github.com/gists/${gistId}`, {
+              headers,
+              cache: 'no-store'
+            });
+          }
+        }
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const result = await res.json();
-        const fileObj = result.files && (result.files['kotonoha_grammar_sync.json'] || Object.values(result.files)[0]);
-        if (!fileObj || !fileObj.content) throw new Error('Empty content');
-        const remoteData = JSON.parse(fileObj.content);
+        if (!result || !result.files) throw new Error('No files in Gist');
+
+        let remoteData = null;
+        const mainFile = result.files['kotonoha_grammar_sync.json'] || Object.values(result.files)[0];
+
+        // 情况 1：新版多文件分片存储（突破 GitHub 单文件 1MB 截断限制）
+        if (result.files['kotonoha_chunk_1.txt']) {
+          let meta = null;
+          if (mainFile && mainFile.content) {
+            try { meta = JSON.parse(mainFile.content); } catch (e) {}
+          }
+          const chunkCount = (meta && meta.chunkCount) ? meta.chunkCount : 20;
+          let combined = '';
+          for (let i = 1; i <= chunkCount; i++) {
+            const cFile = result.files[`kotonoha_chunk_${i}.txt`];
+            if (!cFile) break;
+            if (cFile.truncated && cFile.raw_url) {
+              const rawRes = await fetch(cFile.raw_url, { cache: 'no-store' });
+              combined += await rawRes.text();
+            } else {
+              combined += (cFile.content || '');
+            }
+          }
+          remoteData = JSON.parse(combined);
+        } else if (mainFile) {
+          // 情况 2：旧版单文件超过 1MB (1010.3 KB) 触发 GitHub API truncated: true 截断
+          let rawJsonText = mainFile.content || '';
+          if (mainFile.truncated && mainFile.raw_url) {
+            const rawRes = await fetch(mainFile.raw_url, { cache: 'no-store' });
+            if (!rawRes.ok) throw new Error('Raw fetch failed');
+            rawJsonText = await rawRes.text();
+          } else {
+            try {
+              remoteData = JSON.parse(rawJsonText);
+            } catch (parseErr) {
+              if (mainFile.raw_url) {
+                const rawRes = await fetch(mainFile.raw_url, { cache: 'no-store' });
+                if (!rawRes.ok) throw new Error('Raw fallback failed');
+                rawJsonText = await rawRes.text();
+              } else {
+                throw parseErr;
+              }
+            }
+          }
+          if (!remoteData) {
+            remoteData = JSON.parse(rawJsonText);
+          }
+        }
+
+        if (!remoteData || !Array.isArray(remoteData.grammars)) {
+          throw new Error('Invalid remote data structure');
+        }
         mergeIncomingDataset(remoteData, false);
-        showToast('☁️ 已从云端拉取并合并最新语法与附录数据！');
+        showToast(`☁️ 云端拉取成功！已同步 ${remoteData.grammars.length} 条语法与 ${(remoteData.appendices || []).length} 篇附录`);
       } catch (err) {
-        showToast('从云端拉取失败，请检查 Gist ID 或改用「跨设备同步码」', 'error');
+        showToast('从云端拉取失败：请先在电脑端用新版页面点击一次「推送到云端」，或检查 Gist ID / 网络', 'error');
       }
     }
 
@@ -18484,7 +18618,7 @@
       }
       if (overwriteAll) {
         appState.data = {
-          version: '1.0.0',
+          version: incoming.version || '5.0.0-N1-TO-N5-ALL-739',
           updatedAt: Date.now(),
           grammars: incoming.grammars,
           appendices: Array.isArray(incoming.appendices) ? incoming.appendices : []
